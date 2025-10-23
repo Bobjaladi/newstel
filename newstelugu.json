@@ -1,0 +1,12 @@
+[
+  {
+    "image": "https://raw.githubusercontent.com/username/repo/main/image1.jpg",
+    "title": "Daily Bible Verse",
+    "description": "Jesus loves you"
+  },
+  {
+    "image": "https://raw.githubusercontent.com/username/repo/main/image2.jpg",
+    "title": "Christian News",
+    "description": "Latest news from the church"
+  }
+]
