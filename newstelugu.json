@@ -1,12 +1,10 @@
 [
-  {
-    "image": "https://raw.githubusercontent.com/username/repo/main/image1.jpg",
-    "title": "Daily Bible Verse",
-    "description": "Jesus loves you"
-  },
-  {
-    "image": "https://raw.githubusercontent.com/username/repo/main/image2.jpg",
-    "title": "Christian News",
-    "description": "Latest news from the church"
-  }
+    [
+        "highlight of the day ",
+        "Thanks lord for gave me a various things iam very thankful love you god"
+    ],
+    [
+        "highlight two",
+        "thanks lord one again"
+    ]
 ]
