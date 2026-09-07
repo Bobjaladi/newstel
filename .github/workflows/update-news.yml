@@ -1,1 +1,128 @@
+name: Auto Update News
 
+on:
+  # Schedule: Every 4 hours from 5 AM to 9 PM IST
+  # IST = UTC + 5:30
+  # 05:00 IST = 23:30 UTC (previous day)
+  # 09:00 IST = 03:30 UTC
+  # 13:00 IST = 07:30 UTC
+  # 17:00 IST = 11:30 UTC
+  # 21:00 IST = 15:30 UTC
+  schedule:
+    - cron: '30 23 * * *'  # 05:00 IST (23:30 UTC previous day)
+    - cron: '30 3 * * *'   # 09:00 IST (03:30 UTC)
+    - cron: '30 7 * * *'   # 13:00 IST (07:30 UTC)
+    - cron: '30 11 * * *'  # 17:00 IST (11:30 UTC)
+    - cron: '30 15 * * *'  # 21:00 IST (15:30 UTC)
+  
+  # Allow manual trigger
+  workflow_dispatch:
+
+# Prevent concurrent runs
+concurrency:
+  group: news-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update-news:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Step 1 - Run news_ai_agent.py
+        id: agent
+        run: |
+          echo "📰 Running news AI agent..."
+          python news_ai_agent.py
+          
+          # Check if telugu_news_output.json was created
+          if [ ! -f "telugu_news_output.json" ]; then
+            echo "❌ Error: telugu_news_output.json was not created"
+            exit 1
+          fi
+          
+          # Validate JSON
+          python -c "import json; json.load(open('telugu_news_output.json'))" || {
+            echo "❌ Error: telugu_news_output.json is not valid JSON"
+            exit 1
+          }
+          
+          echo "✅ telugu_news_output.json created and validated"
+        env:
+          PYTHONHASHSEED: 0
+
+      - name: Step 2 - Run translate_news.py
+        id: translate
+        run: |
+          echo "🌐 Running translation agent..."
+          python translate_news.py
+          
+          # Check if output files were created
+          for file in telugu_news_output.json newstelugu.json english.json hindi.json; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Error: $file was not created"
+              exit 1
+            fi
+            
+            # Validate JSON
+            python -c "import json; json.load(open('$file'))" || {
+              echo "❌ Error: $file is not valid JSON"
+              exit 1
+            }
+            
+            echo "✅ $file validated"
+          done
+
+      - name: Step 3 - Commit and push changes
+        id: commit
+        run: |
+          # Get current time in IST
+          CURRENT_TIME=$(TZ="Asia/Kolkata" date +"%Y-%m-%d %H:%M IST")
+          
+          # Check for changes
+          git add telugu_news_output.json newstelugu.json english.json hindi.json
+          
+          if git diff --staged --quiet; then
+            echo "️ No news changes detected. Nothing to commit."
+            echo "changes_made=false" >> $GITHUB_OUTPUT
+          else
+            git commit -m "Auto update news - $CURRENT_TIME"
+            git push origin HEAD:main
+            echo "✅ Changes committed and pushed"
+            echo "changes_made=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "📊 Workflow Execution Summary"
+          echo "=========================================="
+          echo "Time: $(TZ="Asia/Kolkata" date +"%Y-%m-%d %H:%M:%S IST")"
+          echo "Agent Status: ${{ steps.agent.outcome }}"
+          echo "Translation Status: ${{ steps.translate.outcome }}"
+          echo "Changes Made: ${{ steps.commit.outputs.changes_made }}"
+          echo "=========================================="
