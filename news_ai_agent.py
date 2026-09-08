@@ -6,7 +6,7 @@ import time
 import html
 import random
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from typing import List
@@ -18,10 +18,8 @@ translation_cache = {}
 # ===== TRANSLATION OPTIMIZATION FUNCTIONS (TARGET: TELUGU) =====
 
 def clean_text_for_translation(text: str) -> str:
-    """Cleans text to prevent translator crashes while preserving meaningful content."""
     if not text or not isinstance(text, str):
         return ""
-    
     text = html.unescape(text)
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
@@ -30,30 +28,21 @@ def clean_text_for_translation(text: str) -> str:
     
     def truncate_long_urls(match):
         url = match.group(0)
-        if len(url) > 150:
-            return url[:140] + "...[link]"
-        return url
+        return url[:140] + "...[link]" if len(url) > 150 else url
     text = re.sub(r'https?://[^\s<>"]+', truncate_long_urls, text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
 
 def split_text_intelligently(text: str, max_length: int) -> list:
-    """Splits text intelligently: paragraphs -> sentences -> words -> hard split."""
     if len(text) <= max_length:
         return [text]
-    
     chunks = []
     paragraphs = [p.strip() for p in re.split(r'\n+', text) if p.strip()]
     current_chunk = ""
-    
     for p in paragraphs:
         if len(current_chunk) + len(p) + 1 <= max_length:
             current_chunk += (" " + p) if current_chunk else p
         else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            
+            if current_chunk: chunks.append(current_chunk)
             if len(p) > max_length:
                 sentences = re.split(r'(?<=[।.?!])\s+', p)
                 current_chunk = ""
@@ -61,9 +50,7 @@ def split_text_intelligently(text: str, max_length: int) -> list:
                     if len(current_chunk) + len(s) + 1 <= max_length:
                         current_chunk += (" " + s) if current_chunk else s
                     else:
-                        if current_chunk:
-                            chunks.append(current_chunk)
-                        
+                        if current_chunk: chunks.append(current_chunk)
                         if len(s) > max_length:
                             words = s.split(' ')
                             current_chunk = ""
@@ -71,140 +58,143 @@ def split_text_intelligently(text: str, max_length: int) -> list:
                                 if len(current_chunk) + len(w) + 1 <= max_length:
                                     current_chunk += (" " + w) if current_chunk else w
                                 else:
-                                    if current_chunk:
-                                        chunks.append(current_chunk)
+                                    if current_chunk: chunks.append(current_chunk)
                                     current_chunk = w
-                        else:
-                            current_chunk = s
-            else:
-                current_chunk = p
-                
-    if current_chunk:
-        chunks.append(current_chunk)
+                        else: current_chunk = s
+            else: current_chunk = p
+    if current_chunk: chunks.append(current_chunk)
     
     final_chunks = []
     for c in chunks:
         c = c.strip()
-        if not c:
-            continue
+        if not c: continue
         if len(c) > max_length:
-            for i in range(0, len(c), max_length):
-                final_chunks.append(c[i:i+max_length].strip())
-        else:
-            final_chunks.append(c)
-            
+            for i in range(0, len(c), max_length): final_chunks.append(c[i:i+max_length].strip())
+        else: final_chunks.append(c)
     return final_chunks
 
-def translate_text_with_adaptive_chunking(text: str, text_name: str, max_retries: int = 3) -> tuple:
-    """Orchestrates translation with adaptive chunking, exponential backoff, jitter, caching, and graceful degradation."""
-    if not text or not isinstance(text, str):
-        return text, False
-        
-    cleaned = clean_text_for_translation(text)
-    if not cleaned:
-        return text, False
-        
-    chunk_sizes = [900, 700, 500, 300]
+def translate_single_chunk_with_fallback(text: str, chunk_name: str, max_retries: int = 3) -> tuple:
+    """Translates a single chunk, reducing its own size on failure without affecting other chunks."""
+    if not text: 
+        return "", True
     
-    for size in chunk_sizes:
-        print(f"   {text_name}: Attempting translation with max chunk size {size}...")
-        chunks = split_text_intelligently(cleaned, size)
-        print(f"   {text_name}: Split into {len(chunks)} chunks")
+    # Try 900 first. If it fails repeatedly, reduce size for THIS specific chunk only.
+    sizes_to_try = [900, 450, 200]
+    
+    for size in sizes_to_try:
+        sub_chunks = split_text_intelligently(text, size)
+        translated_parts = []
+        chunk_success = True
         
-        translated_chunks = []
-        all_succeeded = True
-        
-        for i, chunk in enumerate(chunks, 1):
-            chunk_name = f"{text_name} chunk {i} (len:{len(chunk)})"
+        for i, sub_chunk in enumerate(sub_chunks, 1):
+            sub_name = f"{chunk_name} (sub {i}, len:{len(sub_chunk)})"
             success = False
             
             for attempt in range(max_retries):
                 try:
-                    cache_key = hashlib.md5(chunk.encode('utf-8')).hexdigest()
-                    if cache_key in translation_cache:
+                    cache_key = hashlib.md5(sub_chunk.encode('utf-8')).hexdigest()
+                    is_cache_hit = cache_key in translation_cache
+                    
+                    if is_cache_hit:
                         translated = translation_cache[cache_key]
+                        print(f"         ✅ {sub_name}: Cache hit")
                         success = True
                     else:
                         translator = GoogleTranslator(source='auto', target='te')
-                        translated = translator.translate(chunk)
-                        
+                        translated = translator.translate(sub_chunk)
                         if translated and isinstance(translated, str):
                             translated = translated.strip()
-                            error_indicators = ['error 500', 'server error', 'bad request', 'internal server error', 'too many requests', 'service unavailable']
-                            if any(err in translated.lower() for err in error_indicators):
-                                raise ValueError(f"Translator returned error-like string: {translated[:50]}")
-                            
+                            if any(err in translated.lower() for err in ['error 500', 'server error', 'bad request', 'too many requests', 'translation error']):
+                                raise ValueError("Translator returned error")
                             translation_cache[cache_key] = translated
+                            print(f"         ✅ {sub_name}: Translated via API")
                             success = True
                     
                     if success:
-                        if attempt > 0:
-                            print(f"   {chunk_name}: SUCCESS (after {attempt} retries)")
-                        else:
-                            print(f"   {chunk_name}: SUCCESS")
-                        translated_chunks.append(translated)
-                        time.sleep(random.uniform(0.8, 2.0))
+                        translated_parts.append(translated)
+                        # 0 seconds delay for cache hit, 0.3-0.7s for successful API call
+                        if not is_cache_hit:
+                            time.sleep(random.uniform(0.3, 0.7))
                         break
                         
                 except Exception as e:
-                    delay = (2 ** attempt) + random.uniform(0.5, 1.5)
-                    print(f"   {chunk_name}: RETRY {attempt + 1}/{max_retries} ({type(e).__name__}, waiting {delay:.1f}s...)")
+                    # Exponential backoff ONLY on failure
+                    delay = (2 ** attempt) + random.uniform(0.3, 0.7)
+                    print(f"         ⚠️ {sub_name}: RETRY {attempt + 1}/{max_retries} (waiting {delay:.1f}s...)")
                     time.sleep(delay)
             
             if not success:
-                all_succeeded = False
-                break
+                chunk_success = False
+                break # Break sub_chunks loop, try next smaller size for this chunk
                 
-        if all_succeeded:
-            final_text = " ".join(translated_chunks)
-            print(f"   {text_name}: SUCCESS")
-            return final_text, True
+        if chunk_success:
+            return " ".join(translated_parts), True
             
-        print(f"   {text_name}: Failed at size {size}, trying smaller chunk size...")
-        
-    print(f"   ❌ {text_name}: FAILED after all retries and fallback sizes.")
-    print(f"   ↪ Keeping original text for this article.")
+    print(f"      ❌ {chunk_name}: Translation failed after all retries and size reductions.")
     return text, False
 
-# ===== ASTROLOGY/HOROSCOPE FILTER =====
+def translate_text_with_adaptive_chunking(text: str, text_name: str, max_retries: int = 3) -> tuple:
+    if not text or not isinstance(text, str): 
+        return text, True
+    cleaned = clean_text_for_translation(text)
+    if not cleaned: 
+        return text, True
+        
+    start_time = time.time()
+    # First, try to split the whole text into 900 char chunks
+    main_chunks = split_text_intelligently(cleaned, 900)
+    print(f"   🌐 {text_name}: Starting translation ({len(main_chunks)} chunk(s))...")
+    
+    translated_chunks = []
+    all_succeeded = True
+    
+    for i, chunk in enumerate(main_chunks, 1):
+        chunk_name = f"{text_name} part {i}"
+        translated_part, success = translate_single_chunk_with_fallback(chunk, chunk_name, max_retries)
+        translated_chunks.append(translated_part)
+        if not success:
+            all_succeeded = False
+            
+    elapsed = time.time() - start_time
+    status = "✅ Success" if all_succeeded else "⚠️ Partial/Failed (Fallback to original used for failed parts)"
+    print(f"   ⏱️ {text_name} translation completed in {elapsed:.2f}s. Status: {status}")
+    
+    return " ".join(translated_chunks), all_succeeded
 
-def is_astrology_news(title: str, description: str) -> bool:
+# ===== ADVANCED ARTICLE FILTERING =====
+
+def should_skip_article(title: str, description: str) -> bool:
     combined_text = f"{title} {description}".lower()
-    astrology_keywords = [
-        'horoscope', 'astrology', 'zodiac',
-        'రాశి', 'జాతక', 'దినఫలం', 'వార ఫలం', 'మాస ఫలం', 'rasiphalalu', 'dinaphalam'
+    skip_keywords = [
+        'horoscope', 'astrology', 'zodiac', 'రాశి', 'జాతక', 'దినఫలం', 'వార ఫలం', 'మాస ఫలం', 'rasiphalalu', 'dinaphalam',
+        'temple', 'దేవాలయం', 'ఆలయం', 'గుడి', 'devasthanam', 'tirupati', 'స్వామి', 'దర్శనం', 'puja', 'పూజ',
+        'promotion', 'ప్రమోషన్', 'ప్రకటన', 'advertisement', 'subscribe', 'follow us', 'మా ఛానల్', 'సబ్స్క్రైబ్'
     ]
-    for keyword in astrology_keywords:
-        if keyword in combined_text:
-            return True
-    return False
+    return any(kw in combined_text for kw in skip_keywords)
 
-# ===== SMART DESCRIPTION FALLBACK =====
+# ===== SMART DESCRIPTION FALLBACK (ENHANCED FOR BBC & TV9) =====
 
-def fetch_article_description_fallback(url: str) -> str:
+def fetch_article_description_fallback(url: str, max_paragraphs: int = 4) -> str:
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=8)
         response.raise_for_status()
-        
         p_tags = re.findall(r'<p[^>]*>(.*?)</p>', response.text, re.IGNORECASE | re.DOTALL)
         clean_parts = []
         for p in p_tags:
             text = re.sub(r'<[^>]+>', ' ', p)
             text = html.unescape(text)
             text = re.sub(r'\s+', ' ', text).strip()
-            if len(text) > 50 and not any(bad in text.lower() for bad in ['advertisement', 'ప్రకటన', 'follow us', 'subscribe']):
+            if len(text) > 50 and not any(bad in text.lower() for bad in ['advertisement', 'ప్రకటన', 'subscribe', 'మా ఛానల్']):
                 clean_parts.append(text)
-                if len(clean_parts) >= 3:
-                    break
+                if len(clean_parts) >= max_paragraphs: break
         return " ".join(clean_parts)
     except Exception as e:
-        print(f"   ⚠️ Fallback scrape failed for {url}: {e}")
         return ""
 
-# ===== HIGH-QUALITY IMAGE EXTRACTION =====
+# ===== HIGH-QUALITY IMAGE EXTRACTION (GUARDIAN, BBC, INDIAN EXPRESS) =====
 
-def extract_guardian_image_candidates(entry: dict, base_url: str) -> List[str]:
+def extract_image_candidates(entry: dict, base_url: str) -> List[str]:
     candidates = []
     def add_candidate(url):
         if not url: return
@@ -213,10 +203,9 @@ def extract_guardian_image_candidates(entry: dict, base_url: str) -> List[str]:
         elif url.startswith('/'):
             parsed_base = urlparse(base_url)
             url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
-        if url.startswith('http://') or url.startswith('https://'):
+        if url.startswith('http'):
             url = url.rstrip('.,)"\'')
-            if url not in candidates:
-                candidates.append(url)
+            if url not in candidates: candidates.append(url)
 
     if 'media_content' in entry:
         for media in entry['media_content']: add_candidate(media.get('url', ''))
@@ -225,124 +214,111 @@ def extract_guardian_image_candidates(entry: dict, base_url: str) -> List[str]:
     if 'media_thumbnail' in entry:
         for thumb in entry['media_thumbnail']: add_candidate(thumb.get('url', ''))
             
-    content_text = ""
-    if 'content' in entry and len(entry['content']) > 0:
-        content_text = entry['content'][0].get('value', '')
-    if not content_text:
-        content_text = entry.get('summary', '') or entry.get('description', '')
-        
+    content_text = entry.get('content', [{}])[0].get('value', '') if 'content' in entry else ''
+    if not content_text: content_text = entry.get('summary', '') or entry.get('description', '')
     if content_text:
-        img_matches = re.findall(r'<img[^>]+src=["\']?([^"\'>\s]+)["\']?', content_text, re.IGNORECASE)
-        for img_src in img_matches: add_candidate(img_src)
-            
-    for key, value in entry.items():
-        if isinstance(value, str) and ('guim.co.uk' in value or 'guardian.co.uk' in value or 'http' in value or 'cnn.com' in value):
-            url_matches = re.findall(r'(https?://[^\s<>"\']+)', value, re.IGNORECASE)
-            for url_match in url_matches: add_candidate(url_match)
+        for img_src in re.findall(r'<img[^>]+src=["\']?([^"\'>\s]+)["\']?', content_text, re.IGNORECASE):
+            add_candidate(img_src)
     return candidates
 
-def score_guardian_image(url: str) -> int:
-    if not url or 'guim.co.uk' not in url.lower(): return -9999
+def score_image(url: str) -> int:
+    if not url: return -9999
     url_lower = url.lower()
     if any(bad in url_lower for bad in ['logo', 'icon', 'avatar', 'spacer', 'pixel', 'dot.gif']): return -9999
     score = 0
-    if any(sw in url_lower for sw in ['width=140', 'width=120', 'width=100', 'width=180', 'width=200']): score -= 1000
+    if 'guim.co.uk' in url_lower: score += 100
+    if 'ichef.bbci.co.uk' in url_lower: score += 100 # BBC images get a boost
+    if 'indianexpress.com' in url_lower: score += 100 # Boost for Indian Express images
+    if url.startswith('https://'): score += 50
+    if '/master/' in url_lower: score += 200
+    
     width_match = re.search(r'[?&]width=(\d+)', url_lower)
     if width_match:
         w = int(width_match.group(1))
         if w >= 1200: score += 300
         elif w >= 800: score += 200
-        elif w >= 500: score += 100
         elif w <= 300: score -= 200
-    dim_match = re.search(r'/(\d+)_(\d+)_(\d+)_(\d+)/', url_lower)
-    if dim_match:
-        max_dim = max(int(dim_match.group(3)), int(dim_match.group(4)))
-        if max_dim >= 2000: score += 500
-        elif max_dim >= 1000: score += 300
-        elif max_dim >= 500: score += 100
-    if '/master/' in url_lower: score += 200
-    if url.startswith('https://'): score += 50
-    if 'guim.co.uk' in url_lower: score += 100
     return score
 
-def upgrade_guardian_image_url(url: str) -> str:
-    if not url or 'guim.co.uk' not in url: return url
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    query_params['width'] = ['1200']
-    query_params['quality'] = ['90']
-    if 'auto' not in query_params: query_params['auto'] = ['format']
-    if 'fit' not in query_params: query_params['fit'] = ['max']
-    flat_params = {k: v[0] if len(v) == 1 else v for k, v in query_params.items()}
-    new_query = urlencode(flat_params, doseq=True)
-    new_parsed = parsed._replace(query=new_query)
-    return urlunparse(new_parsed)
+def upgrade_image_url(url: str) -> str:
+    if not url: return url
+    
+    # Upgrade Guardian Images
+    if 'guim.co.uk' in url:
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        query_params['width'] = ['1200']
+        query_params['quality'] = ['90']
+        if 'auto' not in query_params: query_params['auto'] = ['format']
+        flat_params = {k: v[0] if len(v) == 1 else v for k, v in query_params.items()}
+        return urlunparse(parsed._replace(query=urlencode(flat_params, doseq=True)))
+        
+    # Upgrade BBC Images (Replace low-res path with 1024px)
+    if 'ichef.bbci.co.uk' in url:
+        url = re.sub(r'(/ace/[^/]+/)\d+/', r'\g<1>1024/', url)
+        url = re.sub(r'ichef\.bbci\.co\.uk/news/\d+/', 'ichef.bbci.co.uk/news/1024/', url)
+        url = re.sub(r'ichef\.bbci\.co\.uk/news/branded_[a-z]+/\d+/', 'ichef.bbci.co.uk/news/branded_telugu/1024/', url)
+        
+    # Upgrade Indian Express Images (Ensure high resolution)
+    if 'indianexpress.com' in url:
+        url = re.sub(r'/\d{3,4}x\d{3,4}/', '/1200x900/', url)
+        
+    return url
 
 def validate_image_url(url: str) -> tuple:
-    if not url or not isinstance(url, str): return False, 0, ""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    if not url: return False, 0, ""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         response = requests.head(url, headers=headers, timeout=5, allow_redirects=True)
-        if response.status_code == 200 and response.headers.get('Content-Type', '').lower().startswith('image/'):
+        if response.status_code == 200 and 'image/' in response.headers.get('Content-Type', ''):
             return True, response.status_code, response.headers.get('Content-Type', '')
-        response = requests.get(url, headers=headers, timeout=5, allow_redirects=True, stream=True)
-        if response.status_code == 200 and response.headers.get('Content-Type', '').lower().startswith('image/'):
-            return True, response.status_code, response.headers.get('Content-Type', '')
-        return False, response.status_code, response.headers.get('Content-Type', '')
-    except requests.RequestException:
-        return False, 0, ""
+        return False, response.status_code, ""
+    except: return False, 0, ""
 
-def get_best_guardian_image(candidates: List[str]) -> str:
-    guardian_candidates = [url for url in candidates if 'guim.co.uk' in url.lower()]
-    if not guardian_candidates: return ""
-    scored_candidates = [(url, score_guardian_image(url)) for url in guardian_candidates]
-    scored_candidates.sort(key=lambda x: x[1], reverse=True)
-    for url, score in scored_candidates:
+def get_best_image(candidates: List[str]) -> str:
+    if not candidates: return "https://i.ibb.co/placeholder.jpg"
+    scored = [(url, score_image(url)) for url in candidates]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    
+    for url, _ in scored:
         test_urls = [url]
-        width_match = re.search(r'[?&]width=(\d+)', url.lower())
-        if any(sw in url.lower() for sw in ['width=140', 'width=120', 'width=100', 'width=180', 'width=200']) or (width_match and int(width_match.group(1)) < 1000):
-            upgraded_url = upgrade_guardian_image_url(url)
-            if upgraded_url != url: test_urls.insert(0, upgraded_url)
+        upgraded = upgrade_image_url(url)
+        if upgraded != url: test_urls.insert(0, upgraded)
+        
         for test_url in test_urls:
-            is_valid, status_code, content_type = validate_image_url(test_url)
-            if is_valid: return test_url
-    return scored_candidates[0][0] if scored_candidates else ""
+            if validate_image_url(test_url)[0]:
+                return test_url
+    return scored[0][0] if scored else candidates[0]
 
 # ===== NEWS RSS AGENT =====
 
 class NewsRSSAgent:
     def __init__(self):
         self.today_date = datetime.now().strftime("%d-%m-%Y")
-        self.image_placeholder = "https://i.ibb.co/placeholder.jpg"
         
-    def extract_image_url(self, entry: dict, base_url: str) -> str:
-        candidates = extract_guardian_image_candidates(entry, base_url)
-        best_guardian = get_best_guardian_image(candidates)
-        if best_guardian: return best_guardian
-        for url in candidates:
-            url_lower = url.lower()
-            if any(bad_word in url_lower for bad_word in ['logo', 'icon', 'spacer', 'pixel', 'avatar', 'dot.gif']):
-                continue
-            is_valid, status_code, content_type = validate_image_url(url)
-            if is_valid: return url
-        return candidates[0] if candidates else self.image_placeholder
-
     def format_date(self, entry: dict) -> str:
         parsed_time = entry.get('published_parsed') or entry.get('updated_parsed')
         if parsed_time:
             try: return time.strftime("%d-%m-%Y", parsed_time)
-            except Exception: pass
+            except: pass
         raw_date = entry.get('published') or entry.get('pubDate') or ''
         if not raw_date: return self.today_date
-        try:
-            dt = parsedate_to_datetime(raw_date)
-            return dt.strftime("%d-%m-%Y")
-        except (ValueError, TypeError, OverflowError):
+        try: return parsedate_to_datetime(raw_date).strftime("%d-%m-%Y")
+        except:
             match = re.search(r'(\d{4}-\d{2}-\d{2})', raw_date)
             if match:
                 y, m, d = match.group(1).split('-')
                 return f"{d}-{m}-{y}"
             return self.today_date
+        
+    def is_article_fresh(self, entry: dict, max_age_days: int = 3) -> bool:
+        parsed_time = entry.get('published_parsed') or entry.get('updated_parsed')
+        if parsed_time:
+            try:
+                pub_date = datetime(*parsed_time[:6])
+                return (datetime.now() - pub_date).total_seconds() < (max_age_days * 86400)
+            except: pass
+        return True
         
     def fetch_rss_feeds(self, rss_sources: List[dict]) -> List[List[str]]:
         all_results = []
@@ -350,28 +326,17 @@ class NewsRSSAgent:
         print("=" * 60)
         
         for source in rss_sources:
-            url = source["url"]
-            name = source["name"]
+            url, name = source["url"], source["name"]
             max_articles = source.get("max_articles", 20)
-            translate_to_telugu = source.get("translate_to_telugu", False)
+            translate = source.get("translate_to_telugu", False)
+            max_age = source.get("max_age_days", 3)
             prefix = name.replace(" Telugu", "").strip()
             
             print(f"\n🔄 Fetching from: {name} - Target: {max_articles} articles")
-            print(f"   🔗 Source URL: {url}")
             
             try:
-                # 1. CACHE BUSTING: Force fresh feed from CDN
-                cache_buster = int(time.time())
-                separator = '&' if '?' in url else '?'
-                fetch_url = f"{url}{separator}_cb={cache_buster}"
-                
-                # 2. STRICT NO-CACHE HEADERS
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    'Pragma': 'no-cache',
-                    'Expires': '0'
-                }
+                headers = {'User-Agent': 'Mozilla/5.0', 'Cache-Control': 'no-cache'}
+                fetch_url = f"{url}{'&' if '?' in url else '?'}_cb={int(time.time())}"
                 response = requests.get(fetch_url, headers=headers, timeout=15)
                 response.raise_for_status()
                 feed = feedparser.parse(response.content)
@@ -380,112 +345,100 @@ class NewsRSSAgent:
                     print(f"⚠️ No entries found for {name}")
                     continue
                 
-                fetched_count = 0
-                seen_links = set() # 3. DEDUPLICATION within this run
+                fetched_count, skipped_old = 0, 0
                 
                 for entry in feed.entries:
-                    if fetched_count >= max_articles:
-                        break
-                        
+                    if fetched_count >= max_articles: break
                     try:
                         original_link = entry.get('link', '').strip()
                         
-                        # Skip if we've already seen this exact article link in this run
-                        if original_link in seen_links:
-                            print(f"   ⏭️ Skipping duplicate: {original_link[:60]}...")
+                        # Freshness filtering applies to The Guardian and Indian Express India
+                        if name in ["The Guardian", "Indian Express India"] and not self.is_article_fresh(entry, max_age):
+                            skipped_old += 1
                             continue
-                        seen_links.add(original_link)
                         
-                        raw_title = entry.get('title', 'No Title Available')
-                        title = clean_text_for_translation(raw_title)
-                        if not title: title = "No Title Available"
-                        
+                        raw_title = clean_text_for_translation(entry.get('title', 'No Title'))
                         raw_desc = entry.get('summary') or entry.get('description', '')
                         if not raw_desc or len(raw_desc) < 100:
-                            if 'content' in entry and len(entry['content']) > 0:
-                                raw_desc = entry['content'][0].get('value', '')
-                                
-                        if not raw_desc or len(clean_text_for_translation(raw_desc)) < 100:
-                            if original_link:
-                                scraped_desc = fetch_article_description_fallback(original_link)
-                                if scraped_desc:
-                                    raw_desc = scraped_desc
-                                    print(f"   🔗 Scraped rich description from webpage for: {title[:40]}...")
+                            if 'content' in entry and entry['content']: raw_desc = entry['content'][0].get('value', '')
+                            
+                        # Fetch richer descriptions for BBC, NTV, TV9, and Indian Express
+                        target_len = 150 if name in ["BBC Telugu", "TV9 Telugu", "Indian Express India"] else 100
+                        max_para = 6 if name in ["BBC Telugu", "TV9 Telugu"] else 4
+                        
+                        if not raw_desc or len(clean_text_for_translation(raw_desc)) < target_len:
+                            scraped = fetch_article_description_fallback(original_link, max_paragraphs=max_para)
+                            if scraped: 
+                                raw_desc = scraped
+                                print(f"   🔗 Scraped rich description for: {raw_title[:40]}...")
                         
                         description = clean_text_for_translation(raw_desc)
                         
-                        if is_astrology_news(raw_title, raw_desc):
-                            print(f"   ⏭️ Skipping astrology/horoscope article: {title[:50]}...")
+                        if should_skip_article(raw_title, raw_desc):
+                            print(f"   ⏭️ Skipping unwanted (promo/temple/astro): {raw_title[:50]}...")
                             continue
                         
-                        if len(description) < 20:
-                            description = "Read the full story for more details on this breaking news."
+                        if len(description) < 20: description = "Read the full story for more details."
                         
-                        if translate_to_telugu:
-                            print(f"🌐 Translating {name} article {fetched_count + 1} to Telugu...")
-                            title, title_success = translate_text_with_adaptive_chunking(title, "Title", max_retries=3)
-                            description, desc_success = translate_text_with_adaptive_chunking(description, "Description", max_retries=3)
+                        # ===== EXPLICIT TRANSLATION BLOCK =====
+                        if translate:
+                            print(f"\n🌐 Translating {name} article {fetched_count + 1}...")
                             
-                            if not title_success or not desc_success:
-                                print(f"⚠️ {name} translation partially or fully failed for article {fetched_count + 1}. Keeping original English for failed parts.")
+                            # Translate Title
+                            t_title, t1_success = translate_text_with_adaptive_chunking(raw_title, f"{name} Title", max_retries=3)
+                            if t1_success:
+                                print(f"   ✅ {name} title translated")
+                                raw_title = t_title
+                            else:
+                                print(f"   ❌ {name} title translation failed after retries. Keeping original.")
+                                
+                            # Translate Description
+                            t_desc, t2_success = translate_text_with_adaptive_chunking(description, f"{name} Description", max_retries=3)
+                            if t2_success:
+                                print(f"   ✅ {name} description translated")
+                                description = t_desc
+                            else:
+                                print(f"   ❌ {name} description translation failed after retries. Keeping original.")
                         
-                        if not description.startswith(f"{prefix}:"):
-                            description = f"{prefix}: {description}"
+                        if not description.startswith(f"{prefix}:"): description = f"{prefix}: {description}"
                         
-                        image_url = self.extract_image_url(entry, url)
+                        candidates = extract_image_candidates(entry, url)
+                        image_url = get_best_image(candidates)
                         article_date = self.format_date(entry)
                         
-                        all_results.append([title, description, image_url, article_date, original_link])
+                        all_results.append([raw_title, description, image_url, article_date, original_link])
                         fetched_count += 1
                     except Exception as e:
-                        print(f"⚠️ Error processing individual article from {name}: {str(e)}")
                         continue
                         
-                print(f"✅ Successfully fetched {fetched_count} valid, unique articles from {name}.")
+                print(f"✅ Fetched {fetched_count} articles. (Skipped: {skipped_old} old)")
             except Exception as e:
-                print(f"❌ Error fetching RSS from {name}: {str(e)}")
-                # Don't fail the entire workflow if one source fails
-                continue
+                print(f"❌ Error fetching {name}: {e}")
         
-        print("\n" + "=" * 60)
-        print(f"✅ Aggregation complete! Total articles collected: {len(all_results)}")
+        print(f"\n✅ Aggregation complete! Total: {len(all_results)} articles")
         return all_results
 
     def save_output(self, results: List[List[str]], filename: str = "telugu_news_output.json"):
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"\n💾 Output saved to {filename}")
-    
-    def print_output(self, results: List[List[str]]):
-        print("\n" + "=" * 80)
-        print("📰 SAMPLE FINAL NEWS OUTPUT (First 3 items)")
-        print("=" * 80)
-        for idx, article in enumerate(results[:3], 1):
-            print(f"\n Article {idx}:")
-            print(f"   🏷️  Title: {article[0][:60]}...")
-            print(f"    Desc: {article[1][:100]}...")
-            print(f"   ️  Image: {article[2]}")
-            print(f"   📅 Date: {article[3]}")
-            print(f"   🔗 Link: {article[4]}")
-            print("-" * 80)
+        print(f"💾 Saved to {filename}")
 
 def main():
     agent = NewsRSSAgent()
     
     rss_sources = [
         {"url": "https://ntvtelugu.com/feed", "name": "NTV Telugu", "max_articles": 30, "translate_to_telugu": False},
-        {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian", "max_articles": 14, "translate_to_telugu": True}
+        {"url": "https://indianexpress.com/section/india/feed/", "name": "Indian Express India", "max_articles": 10, "translate_to_telugu": True, "max_age_days": 2},
+        {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian", "max_articles": 10, "translate_to_telugu": True, "max_age_days": 2},
+         {"url": "https://feeds.bbci.co.uk/telugu/rss.xml", "name": "BBC Telugu", "max_articles": 10, "translate_to_telugu": False}
     ]
     
     results = agent.fetch_rss_feeds(rss_sources)
-    
     if not results:
-        print("⚠️ No news articles were fetched. Please check the RSS URLs.")
-        # Exit with error code to stop workflow
+        print("⚠️ No articles fetched.")
         exit(1)
     
-    agent.print_output(results)
-    agent.save_output(results, "telugu_news_output.json")
+    agent.save_output(results)
 
 if __name__ == "__main__":
     main()
