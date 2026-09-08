@@ -12,14 +12,6 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from typing import List
 from deep_translator import GoogleTranslator
 
-# Try to import cloudscraper to bypass Cloudflare/WAF on GitHub Actions
-try:
-    import cloudscraper
-    USE_CLOUDSCRAPER = True
-except ImportError:
-    USE_CLOUDSCRAPER = False
-    print("⚠️ 'cloudscraper' not found. Falling back to standard requests.")
-
 # Global cache for the current execution to avoid redundant API calls
 translation_cache = {}
 
@@ -86,6 +78,7 @@ def translate_single_chunk_with_fallback(text: str, chunk_name: str, max_retries
     if not text: 
         return "", True
     
+    # Try 900 first. If it fails repeatedly, reduce size for THIS specific chunk only.
     sizes_to_try = [900, 450, 200]
     
     for size in sizes_to_try:
@@ -104,6 +97,7 @@ def translate_single_chunk_with_fallback(text: str, chunk_name: str, max_retries
                     
                     if is_cache_hit:
                         translated = translation_cache[cache_key]
+                        print(f"         ✅ {sub_name}: Cache hit")
                         success = True
                     else:
                         translator = GoogleTranslator(source='auto', target='te')
@@ -113,6 +107,7 @@ def translate_single_chunk_with_fallback(text: str, chunk_name: str, max_retries
                             if any(err in translated.lower() for err in ['error 500', 'server error', 'bad request', 'too many requests', 'translation error']):
                                 raise ValueError("Translator returned error")
                             translation_cache[cache_key] = translated
+                            print(f"         ✅ {sub_name}: Translated via API")
                             success = True
                     
                     if success:
@@ -130,7 +125,7 @@ def translate_single_chunk_with_fallback(text: str, chunk_name: str, max_retries
             
             if not success:
                 chunk_success = False
-                break
+                break # Break sub_chunks loop, try next smaller size for this chunk
                 
         if chunk_success:
             return " ".join(translated_parts), True
@@ -146,6 +141,7 @@ def translate_text_with_adaptive_chunking(text: str, text_name: str, max_retries
         return text, True
         
     start_time = time.time()
+    # First, try to split the whole text into 900 char chunks
     main_chunks = split_text_intelligently(cleaned, 900)
     print(f"   🌐 {text_name}: Starting translation ({len(main_chunks)} chunk(s))...")
     
@@ -176,12 +172,12 @@ def should_skip_article(title: str, description: str) -> bool:
     ]
     return any(kw in combined_text for kw in skip_keywords)
 
-# ===== SMART DESCRIPTION FALLBACK =====
+# ===== SMART DESCRIPTION FALLBACK (ENHANCED FOR BBC & TV9) =====
 
 def fetch_article_description_fallback(url: str, max_paragraphs: int = 4) -> str:
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=8)
         response.raise_for_status()
         p_tags = re.findall(r'<p[^>]*>(.*?)</p>', response.text, re.IGNORECASE | re.DOTALL)
         clean_parts = []
@@ -193,10 +189,10 @@ def fetch_article_description_fallback(url: str, max_paragraphs: int = 4) -> str
                 clean_parts.append(text)
                 if len(clean_parts) >= max_paragraphs: break
         return " ".join(clean_parts)
-    except Exception:
+    except Exception as e:
         return ""
 
-# ===== HIGH-QUALITY IMAGE EXTRACTION =====
+# ===== HIGH-QUALITY IMAGE EXTRACTION (GUARDIAN, BBC, INDIAN EXPRESS) =====
 
 def extract_image_candidates(entry: dict, base_url: str) -> List[str]:
     candidates = []
@@ -231,8 +227,8 @@ def score_image(url: str) -> int:
     if any(bad in url_lower for bad in ['logo', 'icon', 'avatar', 'spacer', 'pixel', 'dot.gif']): return -9999
     score = 0
     if 'guim.co.uk' in url_lower: score += 100
-    if 'ichef.bbci.co.uk' in url_lower: score += 100
-    if 'indianexpress.com' in url_lower: score += 100
+    if 'ichef.bbci.co.uk' in url_lower: score += 100 # BBC images get a boost
+    if 'indianexpress.com' in url_lower: score += 100 # Boost for Indian Express images
     if url.startswith('https://'): score += 50
     if '/master/' in url_lower: score += 200
     
@@ -247,6 +243,7 @@ def score_image(url: str) -> int:
 def upgrade_image_url(url: str) -> str:
     if not url: return url
     
+    # Upgrade Guardian Images
     if 'guim.co.uk' in url:
         parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
@@ -256,11 +253,13 @@ def upgrade_image_url(url: str) -> str:
         flat_params = {k: v[0] if len(v) == 1 else v for k, v in query_params.items()}
         return urlunparse(parsed._replace(query=urlencode(flat_params, doseq=True)))
         
+    # Upgrade BBC Images (Replace low-res path with 1024px)
     if 'ichef.bbci.co.uk' in url:
         url = re.sub(r'(/ace/[^/]+/)\d+/', r'\g<1>1024/', url)
         url = re.sub(r'ichef\.bbci\.co\.uk/news/\d+/', 'ichef.bbci.co.uk/news/1024/', url)
         url = re.sub(r'ichef\.bbci\.co\.uk/news/branded_[a-z]+/\d+/', 'ichef.bbci.co.uk/news/branded_telugu/1024/', url)
         
+    # Upgrade Indian Express Images (Ensure high resolution)
     if 'indianexpress.com' in url:
         url = re.sub(r'/\d{3,4}x\d{3,4}/', '/1200x900/', url)
         
@@ -335,114 +334,86 @@ class NewsRSSAgent:
             
             print(f"\n🔄 Fetching from: {name} - Target: {max_articles} articles")
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                'Accept': 'application/rss+xml, application/xml, text/xml, */*;q=0.1',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Connection': 'keep-alive'
-            }
-            
-            fetch_url = f"{url}{'&' if '?' in url else '?'}_cb={int(time.time())}"
-            feed_content = None
-            
             try:
-                # Use cloudscraper if available (highly recommended for Indian Express on GitHub)
-                if USE_CLOUDSCRAPER:
-                    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
-                    response = scraper.get(fetch_url, timeout=15)
-                else:
-                    response = requests.get(fetch_url, headers=headers, timeout=15)
-                
-                if response.status_code in [403, 429, 503]:
-                    print(f"   ⚠️ {name}: Blocked by WAF (HTTP {response.status_code}).")
-                    continue
-                    
+                headers = {'User-Agent': 'Mozilla/5.0', 'Cache-Control': 'no-cache'}
+                fetch_url = f"{url}{'&' if '?' in url else '?'}_cb={int(time.time())}"
+                response = requests.get(fetch_url, headers=headers, timeout=15)
                 response.raise_for_status()
+                feed = feedparser.parse(response.content)
                 
-                # Detect if WAF returned an HTML block page instead of XML RSS
-                content_type = response.headers.get('Content-Type', '').lower()
-                text_snippet = response.text[:500].lower()
-                if 'html' in content_type and '<rss' not in text_snippet and '<feed' not in text_snippet and '<item' not in text_snippet:
-                    print(f"   ⚠️ {name}: Received HTML block page instead of RSS.")
+                if not feed.entries:
+                    print(f"⚠️ No entries found for {name}")
                     continue
-                    
-                feed_content = response.content
                 
-            except Exception as e:
-                print(f"   ⚠️ {name}: Fetch failed ({e}).")
-                continue
+                fetched_count, skipped_old = 0, 0
                 
-            if not feed_content:
-                continue
-                
-            feed = feedparser.parse(feed_content)
-            
-            if not feed.entries:
-                print(f"   ⚠️ {name}: Feed parsed but contains 0 entries.")
-                continue
-            
-            fetched_count, skipped_old = 0, 0
-            
-            for entry in feed.entries:
-                if fetched_count >= max_articles: break
-                try:
-                    original_link = entry.get('link', '').strip()
-                    
-                    if name in ["The Guardian", "Indian Express India"] and not self.is_article_fresh(entry, max_age):
-                        skipped_old += 1
-                        continue
-                    
-                    raw_title = clean_text_for_translation(entry.get('title', 'No Title'))
-                    raw_desc = entry.get('summary') or entry.get('description', '')
-                    if not raw_desc or len(raw_desc) < 100:
-                        if 'content' in entry and entry['content']: raw_desc = entry['content'][0].get('value', '')
+                for entry in feed.entries:
+                    if fetched_count >= max_articles: break
+                    try:
+                        original_link = entry.get('link', '').strip()
                         
-                    target_len = 150 if name in ["BBC Telugu", "TV9 Telugu", "Indian Express India"] else 100
-                    max_para = 6 if name in ["BBC Telugu", "TV9 Telugu"] else 4
-                    
-                    if not raw_desc or len(clean_text_for_translation(raw_desc)) < target_len:
-                        scraped = fetch_article_description_fallback(original_link, max_paragraphs=max_para)
-                        if scraped: 
-                            raw_desc = scraped
-                            print(f"   🔗 Scraped rich description for: {raw_title[:40]}...")
-                    
-                    description = clean_text_for_translation(raw_desc)
-                    
-                    if should_skip_article(raw_title, raw_desc):
-                        print(f"   ⏭️ Skipping unwanted (promo/temple/astro): {raw_title[:50]}...")
-                        continue
-                    
-                    if len(description) < 20: description = "Read the full story for more details."
-                    
-                    if translate:
-                        print(f"\n🌐 Translating {name} article {fetched_count + 1}...")
+                        # Freshness filtering applies to The Guardian and The Hindu National
+                        if name in ["The Guardian", "The Hindu National"] and not self.is_article_fresh(entry, max_age):
+                            skipped_old += 1
+                            continue
                         
-                        t_title, t1_success = translate_text_with_adaptive_chunking(raw_title, f"{name} Title", max_retries=3)
-                        if t1_success:
-                            print(f"   ✅ {name} title translated")
-                            raw_title = t_title
-                        else:
-                            print(f"   ❌ {name} title translation failed after retries. Keeping original.")
+                        raw_title = clean_text_for_translation(entry.get('title', 'No Title'))
+                        raw_desc = entry.get('summary') or entry.get('description', '')
+                        if not raw_desc or len(raw_desc) < 100:
+                            if 'content' in entry and entry['content']: raw_desc = entry['content'][0].get('value', '')
                             
-                        t_desc, t2_success = translate_text_with_adaptive_chunking(description, f"{name} Description", max_retries=3)
-                        if t2_success:
-                            print(f"   ✅ {name} description translated")
-                            description = t_desc
-                        else:
-                            print(f"   ❌ {name} description translation failed after retries. Keeping original.")
-                    
-                    if not description.startswith(f"{prefix}:"): description = f"{prefix}: {description}"
-                    
-                    candidates = extract_image_candidates(entry, url)
-                    image_url = get_best_image(candidates)
-                    article_date = self.format_date(entry)
-                    
-                    all_results.append([raw_title, description, image_url, article_date, original_link])
-                    fetched_count += 1
-                except Exception:
-                    continue
-                    
-            print(f"✅ Fetched {fetched_count} articles. (Skipped: {skipped_old} old)")
+                        # Fetch richer descriptions for BBC, NTV, TV9, and The Hindu National
+                        target_len = 150 if name in ["BBC Telugu", "TV9 Telugu", "The Hindu National"] else 100
+                        max_para = 6 if name in ["BBC Telugu", "TV9 Telugu"] else 4
+                        
+                        if not raw_desc or len(clean_text_for_translation(raw_desc)) < target_len:
+                            scraped = fetch_article_description_fallback(original_link, max_paragraphs=max_para)
+                            if scraped: 
+                                raw_desc = scraped
+                                print(f"   🔗 Scraped rich description for: {raw_title[:40]}...")
+                        
+                        description = clean_text_for_translation(raw_desc)
+                        
+                        if should_skip_article(raw_title, raw_desc):
+                            print(f"   ⏭️ Skipping unwanted (promo/temple/astro): {raw_title[:50]}...")
+                            continue
+                        
+                        if len(description) < 20: description = "Read the full story for more details."
+                        
+                        # ===== EXPLICIT TRANSLATION BLOCK =====
+                        if translate:
+                            print(f"\n🌐 Translating {name} article {fetched_count + 1}...")
+                            
+                            # Translate Title
+                            t_title, t1_success = translate_text_with_adaptive_chunking(raw_title, f"{name} Title", max_retries=3)
+                            if t1_success:
+                                print(f"   ✅ {name} title translated")
+                                raw_title = t_title
+                            else:
+                                print(f"   ❌ {name} title translation failed after retries. Keeping original.")
+                                
+                            # Translate Description
+                            t_desc, t2_success = translate_text_with_adaptive_chunking(description, f"{name} Description", max_retries=3)
+                            if t2_success:
+                                print(f"   ✅ {name} description translated")
+                                description = t_desc
+                            else:
+                                print(f"   ❌ {name} description translation failed after retries. Keeping original.")
+                        
+                        if not description.startswith(f"{prefix}:"): description = f"{prefix}: {description}"
+                        
+                        candidates = extract_image_candidates(entry, url)
+                        image_url = get_best_image(candidates)
+                        article_date = self.format_date(entry)
+                        
+                        all_results.append([raw_title, description, image_url, article_date, original_link])
+                        fetched_count += 1
+                    except Exception as e:
+                        continue
+                        
+                print(f"✅ Fetched {fetched_count} articles. (Skipped: {skipped_old} old)")
+            except Exception as e:
+                print(f"❌ Error fetching {name}: {e}")
         
         print(f"\n✅ Aggregation complete! Total: {len(all_results)} articles")
         return all_results
@@ -457,9 +428,9 @@ def main():
     
     rss_sources = [
         {"url": "https://ntvtelugu.com/feed", "name": "NTV Telugu", "max_articles": 30, "translate_to_telugu": False},
-        {"url": "https://indianexpress.com/section/india/feed/", "name": "Indian Express India", "max_articles": 10, "translate_to_telugu": True, "max_age_days": 2},
+        {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "name": "The Hindu National", "max_articles": 15, "translate_to_telugu": True, "max_age_days": 2},
         {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian", "max_articles": 10, "translate_to_telugu": True, "max_age_days": 2},
-        {"url": "https://feeds.bbci.co.uk/telugu/rss.xml", "name": "BBC Telugu", "max_articles": 10, "translate_to_telugu": False}
+         {"url": "https://feeds.bbci.co.uk/telugu/rss.xml", "name": "BBC Telugu", "max_articles": 10, "translate_to_telugu": False}
     ]
     
     results = agent.fetch_rss_feeds(rss_sources)
