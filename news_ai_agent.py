@@ -428,9 +428,10 @@ def main():
     
     rss_sources = [
         {"url": "https://ntvtelugu.com/feed", "name": "NTV Telugu", "max_articles": 30, "translate_to_telugu": False},
-        {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "name": "The Hindu National", "max_articles": 15, "translate_to_telugu": True, "max_age_days": 2},
-        {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian", "max_articles": 10, "translate_to_telugu": True, "max_age_days": 2},
-         {"url": "https://feeds.bbci.co.uk/telugu/rss.xml", "name": "BBC Telugu", "max_articles": 10, "translate_to_telugu": False}
+       
+         {"url": "https://feeds.bbci.co.uk/telugu/rss.xml", "name": "BBC Telugu", "max_articles": 10, "translate_to_telugu": False},
+         {"url": "https://www.thehindu.com/news/national/feeder/default.rss", "name": "The Hindu National", "max_articles": 10, "translate_to_telugu": False, "max_age_days": 2},
+        {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian", "max_articles": 10, "translate_to_telugu": False, "max_age_days": 2}
     ]
     
     results = agent.fetch_rss_feeds(rss_sources)
